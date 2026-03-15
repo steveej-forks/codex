@@ -5,11 +5,15 @@ use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_core::features::Feature;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
+use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -412,5 +416,111 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
 
     streaming_server.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_output_is_recorded_before_response_completed_when_stream_delayed()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let first_response_id = "resp-apply-1";
+    let second_response_id = "resp-apply-2";
+    let patch = [
+        "*** Begin Patch",
+        "*** Add File: delayed_apply_patch.txt",
+        "+hello from delayed apply_patch",
+        "*** End Patch",
+    ]
+    .join("\n");
+
+    let first_chunk = sse(vec![
+        ev_response_created(first_response_id),
+        ev_apply_patch_custom_tool_call("call-apply-patch", &patch),
+    ]);
+    let second_chunk = sse(vec![ev_completed(first_response_id)]);
+    let follow_up = sse(vec![
+        ev_assistant_message("msg-apply", "done"),
+        ev_completed(second_response_id),
+    ]);
+
+    let (first_gate_tx, first_gate_rx) = oneshot::channel();
+    let (completion_gate_tx, completion_gate_rx) = oneshot::channel();
+    let (follow_up_gate_tx, follow_up_gate_rx) = oneshot::channel();
+    let (streaming_server, _completion_receivers) = start_streaming_sse_server(vec![
+        vec![
+            StreamingSseChunk {
+                gate: Some(first_gate_rx),
+                body: first_chunk,
+            },
+            StreamingSseChunk {
+                gate: Some(completion_gate_rx),
+                body: second_chunk,
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: Some(follow_up_gate_rx),
+            body: follow_up,
+        }],
+    ])
+    .await;
+
+    let builder = test_codex().with_model("gpt-5.1");
+    let test = builder
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::ApplyPatchFreeform)
+                .expect("test config should allow feature update");
+        })
+        .build_with_streaming_server(&streaming_server)
+        .await?;
+
+    let session_model = test.session_configured.model.clone();
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "delay response.completed after apply_patch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_model,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let _ = first_gate_tx.send(());
+
+    let raw_output = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::RawResponseItem(RawResponseItemEvent {
+                item: ResponseItem::CustomToolCallOutput { call_id, .. },
+            }) if call_id == "call-apply-patch"
+        )
+    })
+    .await;
+    assert!(matches!(
+        raw_output,
+        EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::CustomToolCallOutput { call_id, .. },
+        }) if call_id == "call-apply-patch"
+    ));
+    let _ = completion_gate_tx.send(());
+    let _ = follow_up_gate_tx.send(());
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    streaming_server.shutdown().await;
     Ok(())
 }
