@@ -35,6 +35,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct ApplyPatchHandler;
 
@@ -136,26 +137,62 @@ impl ToolHandler for ApplyPatchHandler {
         // Avoid building temporary ExecParams/command vectors; derive directly from inputs.
         let cwd = turn.cwd.clone();
         let command = vec!["apply_patch".to_string(), patch_input.clone()];
+        let verify_started = Instant::now();
+        tracing::debug!(
+            call_id = %call_id,
+            tool_name = %tool_name,
+            patch_bytes = patch_input.len(),
+            cwd = %cwd.display(),
+            "apply_patch verification starting"
+        );
         match codex_apply_patch::maybe_parse_apply_patch_verified(
             &command,
             &cwd,
             session.fs.as_ref(),
         ) {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+                tracing::debug!(
+                    call_id = %call_id,
+                    tool_name = %tool_name,
+                    elapsed_ms = verify_started.elapsed().as_millis(),
+                    change_count = changes.changes().len(),
+                    "apply_patch verification completed"
+                );
+                let internal_started = Instant::now();
                 match apply_patch::apply_patch(turn.as_ref(), changes).await {
                     InternalApplyPatchInvocation::Output(item) => {
+                        tracing::debug!(
+                            call_id = %call_id,
+                            tool_name = %tool_name,
+                            elapsed_ms = internal_started.elapsed().as_millis(),
+                            "apply_patch resolved without exec runtime"
+                        );
                         let content = item?;
                         Ok(FunctionToolOutput::from_text(content, Some(true)))
                     }
                     InternalApplyPatchInvocation::DelegateToExec(apply) => {
+                        tracing::debug!(
+                            call_id = %call_id,
+                            tool_name = %tool_name,
+                            elapsed_ms = internal_started.elapsed().as_millis(),
+                            auto_approved = apply.auto_approved,
+                            "apply_patch delegating to exec runtime"
+                        );
                         let changes = convert_apply_patch_to_protocol(&apply.action);
                         let file_paths = file_paths_for_action(&apply.action);
+                        let approval_started = Instant::now();
                         let effective_additional_permissions = apply_granted_turn_permissions(
                             session.as_ref(),
                             crate::sandboxing::SandboxPermissions::UseDefault,
                             write_permissions_for_paths(&file_paths),
                         )
                         .await;
+                        tracing::debug!(
+                            call_id = %call_id,
+                            tool_name = %tool_name,
+                            elapsed_ms = approval_started.elapsed().as_millis(),
+                            "apply_patch granted-permissions resolved"
+                        );
                         let emitter =
                             ToolEmitter::apply_patch(changes.clone(), apply.auto_approved);
                         let event_ctx = ToolEventCtx::new(
@@ -164,7 +201,14 @@ impl ToolHandler for ApplyPatchHandler {
                             &call_id,
                             Some(&tracker),
                         );
+                        let begin_started = Instant::now();
                         emitter.begin(event_ctx).await;
+                        tracing::debug!(
+                            call_id = %call_id,
+                            tool_name = %tool_name,
+                            elapsed_ms = begin_started.elapsed().as_millis(),
+                            "apply_patch begin event emitted"
+                        );
 
                         let req = ApplyPatchRequest {
                             action: apply.action,
@@ -189,6 +233,7 @@ impl ToolHandler for ApplyPatchHandler {
                             call_id: call_id.clone(),
                             tool_name: tool_name.to_string(),
                         };
+                        let run_started = Instant::now();
                         let out = orchestrator
                             .run(
                                 &mut runtime,
@@ -199,29 +244,63 @@ impl ToolHandler for ApplyPatchHandler {
                             )
                             .await
                             .map(|result| result.output);
+                        tracing::debug!(
+                            call_id = %call_id,
+                            tool_name = %tool_name,
+                            elapsed_ms = run_started.elapsed().as_millis(),
+                            success = out.is_ok(),
+                            "apply_patch runtime finished"
+                        );
                         let event_ctx = ToolEventCtx::new(
                             session.as_ref(),
                             turn.as_ref(),
                             &call_id,
                             Some(&tracker),
                         );
+                        let finish_started = Instant::now();
                         let content = emitter.finish(event_ctx, out).await?;
+                        tracing::debug!(
+                            call_id = %call_id,
+                            tool_name = %tool_name,
+                            elapsed_ms = finish_started.elapsed().as_millis(),
+                            "apply_patch finish event emitted"
+                        );
                         Ok(FunctionToolOutput::from_text(content, Some(true)))
                     }
                 }
             }
             codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
+                tracing::debug!(
+                    call_id = %call_id,
+                    tool_name = %tool_name,
+                    elapsed_ms = verify_started.elapsed().as_millis(),
+                    error = %parse_error,
+                    "apply_patch verification failed"
+                );
                 Err(FunctionCallError::RespondToModel(format!(
                     "apply_patch verification failed: {parse_error}"
                 )))
             }
             codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
+                tracing::debug!(
+                    call_id = %call_id,
+                    tool_name = %tool_name,
+                    elapsed_ms = verify_started.elapsed().as_millis(),
+                    error = ?error,
+                    "apply_patch shell parse failed"
+                );
                 tracing::trace!("Failed to parse apply_patch input, {error:?}");
                 Err(FunctionCallError::RespondToModel(
                     "apply_patch handler received invalid patch input".to_string(),
                 ))
             }
             codex_apply_patch::MaybeApplyPatchVerified::NotApplyPatch => {
+                tracing::debug!(
+                    call_id = %call_id,
+                    tool_name = %tool_name,
+                    elapsed_ms = verify_started.elapsed().as_millis(),
+                    "apply_patch payload did not parse as apply_patch"
+                );
                 Err(FunctionCallError::RespondToModel(
                     "apply_patch handler received non-apply_patch input".to_string(),
                 ))

@@ -215,6 +215,7 @@ fn process_apply_patch(
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    tracing::debug!(patch_bytes = patch.len(), "process_apply_patch starting");
     let exit_code = match codex_apply_patch::apply_patch(
         patch,
         &mut stdout,
@@ -225,6 +226,12 @@ fn process_apply_patch(
         Err(_) => 1,
     };
     let duration = start.elapsed();
+    tracing::debug!(
+        patch_bytes = patch.len(),
+        elapsed_ms = duration.as_millis(),
+        exit_code,
+        "process_apply_patch finished"
+    );
 
     let stdout = StreamOutput::new(String::from_utf8_lossy(&stdout).to_string());
     let stderr = StreamOutput::new(String::from_utf8_lossy(&stderr).to_string());

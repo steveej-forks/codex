@@ -6,6 +6,7 @@ use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
+use tracing::debug;
 use tracing::instrument;
 use tracing::trace_span;
 
@@ -60,6 +61,10 @@ impl ToolCallRuntime {
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let started = Instant::now();
+        let call_id = call.call_id.clone();
+        let tool_name = call.tool_name.clone();
+        let task_call_id = call_id.clone();
+        let task_tool_name = tool_name.clone();
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call",
@@ -71,10 +76,21 @@ impl ToolCallRuntime {
 
         let handle: AbortOnDropHandle<Result<ResponseInputItem, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
+                debug!(
+                    call_id = %task_call_id,
+                    tool_name = %task_tool_name,
+                    "tool future started"
+                );
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         let secs = started.elapsed().as_secs_f32().max(0.1);
                         dispatch_span.record("aborted", true);
+                        debug!(
+                            call_id = %task_call_id,
+                            tool_name = %task_tool_name,
+                            elapsed_secs = secs,
+                            "tool future cancelled"
+                        );
                         Ok(Self::aborted_response(&call, secs))
                     },
                     res = async {
@@ -100,9 +116,35 @@ impl ToolCallRuntime {
 
         async move {
             match handle.await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
-                Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
+                Ok(Ok(response)) => {
+                    debug!(
+                        call_id = %call_id,
+                        tool_name = %tool_name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "tool future completed"
+                    );
+                    Ok(response)
+                }
+                Ok(Err(FunctionCallError::Fatal(message))) => {
+                    debug!(
+                        call_id = %call_id,
+                        tool_name = %tool_name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %message,
+                        "tool future failed fatally"
+                    );
+                    Err(CodexErr::Fatal(message))
+                }
+                Ok(Err(other)) => {
+                    debug!(
+                        call_id = %call_id,
+                        tool_name = %tool_name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %other,
+                        "tool future failed"
+                    );
+                    Err(CodexErr::Fatal(other.to_string()))
+                }
                 Err(err) => Err(CodexErr::Fatal(format!(
                     "tool task failed to receive: {err:?}"
                 ))),
