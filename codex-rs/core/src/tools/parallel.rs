@@ -60,6 +60,8 @@ impl ToolCallRuntime {
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let started = Instant::now();
+        let cancel_call = call.clone();
+        let dispatch_call = call.clone();
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call",
@@ -75,7 +77,7 @@ impl ToolCallRuntime {
                     _ = cancellation_token.cancelled() => {
                         let secs = started.elapsed().as_secs_f32().max(0.1);
                         dispatch_span.record("aborted", true);
-                        Ok(Self::aborted_response(&call, secs))
+                        Ok(Self::aborted_response(&cancel_call, secs))
                     },
                     res = async {
                         let _guard = if supports_parallel {
@@ -89,7 +91,7 @@ impl ToolCallRuntime {
                                 session,
                                 turn,
                                 tracker,
-                                call.clone(),
+                                dispatch_call,
                                 crate::tools::router::ToolCallSource::Direct,
                             )
                             .instrument(dispatch_span.clone())
@@ -101,11 +103,32 @@ impl ToolCallRuntime {
         async move {
             match handle.await {
                 Ok(Ok(response)) => Ok(response),
-                Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
-                Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
-                Err(err) => Err(CodexErr::Fatal(format!(
-                    "tool task failed to receive: {err:?}"
-                ))),
+                Ok(Err(FunctionCallError::Fatal(message))) => {
+                    tracing::error!(
+                        tool_name = %call.tool_name,
+                        call_id = %call.call_id,
+                        "fatal tool error: {message}"
+                    );
+                    Ok(Self::failed_response(&call, message))
+                }
+                Ok(Err(other)) => {
+                    let message = other.to_string();
+                    tracing::error!(
+                        tool_name = %call.tool_name,
+                        call_id = %call.call_id,
+                        "tool error surfaced as fallback output: {message}"
+                    );
+                    Ok(Self::failed_response(&call, message))
+                }
+                Err(err) => {
+                    let message = format!("tool task failed to receive: {err:?}");
+                    tracing::error!(
+                        tool_name = %call.tool_name,
+                        call_id = %call.call_id,
+                        "{message}"
+                    );
+                    Ok(Self::failed_response(&call, message))
+                }
             }
         }
         .in_current_span()
@@ -119,7 +142,7 @@ impl ToolCallRuntime {
                 call_id: call.call_id.clone(),
                 output: FunctionCallOutputPayload {
                     body: FunctionCallOutputBody::Text(Self::abort_message(call, secs)),
-                    ..Default::default()
+                    success: Some(false),
                 },
             },
             ToolPayload::Mcp { .. } => ResponseInputItem::McpToolCallOutput {
@@ -132,7 +155,30 @@ impl ToolCallRuntime {
                 call_id: call.call_id.clone(),
                 output: FunctionCallOutputPayload {
                     body: FunctionCallOutputBody::Text(Self::abort_message(call, secs)),
-                    ..Default::default()
+                    success: Some(false),
+                },
+            },
+        }
+    }
+
+    fn failed_response(call: &ToolCall, message: String) -> ResponseInputItem {
+        match &call.payload {
+            ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
+                call_id: call.call_id.clone(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(message),
+                    success: Some(false),
+                },
+            },
+            ToolPayload::Mcp { .. } => ResponseInputItem::McpToolCallOutput {
+                call_id: call.call_id.clone(),
+                output: codex_protocol::mcp::CallToolResult::from_error_text(message),
+            },
+            _ => ResponseInputItem::FunctionCallOutput {
+                call_id: call.call_id.clone(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(message),
+                    success: Some(false),
                 },
             },
         }

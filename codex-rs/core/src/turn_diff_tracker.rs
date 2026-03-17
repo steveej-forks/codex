@@ -15,6 +15,7 @@ use crate::protocol::FileChange;
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DEV_NULL: &str = "/dev/null";
 
+#[derive(Clone)]
 struct BaselineFileInfo {
     path: PathBuf,
     content: Vec<u8>,
@@ -29,7 +30,7 @@ struct BaselineFileInfo {
 /// 2. Keep a stable internal filename (uuid) per external path for rename tracking.
 /// 3. To compute the aggregated unified diff, compare each baseline snapshot to the current file on disk entirely in-memory
 ///    using the `similar` crate and emit unified diffs with rewritten external paths.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TurnDiffTracker {
     /// Map external path -> internal filename (uuid).
     external_to_temp_name: HashMap<PathBuf, String>,

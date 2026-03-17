@@ -17,13 +17,19 @@ use crate::protocol::PatchApplyStatus;
 use crate::protocol::TurnDiffEvent;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
+use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_protocol::parse_command::ParsedCommand;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::task::spawn_blocking;
+use tokio::time::timeout;
+use tracing::warn;
 
 use super::format_exec_output_str;
+
+const TURN_DIFF_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 pub(crate) struct ToolEventCtx<'a> {
@@ -86,6 +92,50 @@ pub(crate) async fn emit_exec_command_begin(
         )
         .await;
 }
+
+pub(crate) async fn build_turn_diff_event(
+    tracker: &SharedTurnDiffTracker,
+) -> Option<TurnDiffEvent> {
+    build_turn_diff_event_with_timeout(tracker, TURN_DIFF_TIMEOUT, |mut tracker| {
+        tracker.get_unified_diff()
+    })
+    .await
+}
+
+async fn build_turn_diff_event_with_timeout<F>(
+    tracker: &SharedTurnDiffTracker,
+    diff_timeout: Duration,
+    compute_diff: F,
+) -> Option<TurnDiffEvent>
+where
+    F: FnOnce(TurnDiffTracker) -> anyhow::Result<Option<String>> + Send + 'static,
+{
+    let tracker_snapshot = {
+        let guard = tracker.lock().await;
+        guard.clone()
+    };
+    let diff_task = spawn_blocking(move || compute_diff(tracker_snapshot));
+    match timeout(diff_timeout, diff_task).await {
+        Ok(Ok(Ok(Some(unified_diff)))) => Some(TurnDiffEvent { unified_diff }),
+        Ok(Ok(Ok(None))) => None,
+        Ok(Ok(Err(err))) => {
+            warn!("failed to compute turn diff: {err:#}");
+            None
+        }
+        Ok(Err(err)) => {
+            warn!("turn diff task failed: {err}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "turn diff computation exceeded {:?}; skipping diff emission",
+                diff_timeout
+            );
+            None
+        }
+    }
+}
+
 // Concrete, allocation-free emitter: avoid trait objects and boxed futures.
 pub(crate) enum ToolEmitter {
     Shell {
@@ -511,15 +561,55 @@ async fn emit_patch_end(
         )
         .await;
 
-    if let Some(tracker) = ctx.turn_diff_tracker {
-        let unified_diff = {
-            let mut guard = tracker.lock().await;
-            guard.get_unified_diff()
-        };
-        if let Ok(Some(unified_diff)) = unified_diff {
-            ctx.session
-                .send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff }))
-                .await;
-        }
+    if let Some(tracker) = ctx.turn_diff_tracker
+        && let Some(turn_diff_event) = build_turn_diff_event(tracker).await
+    {
+        ctx.session
+            .send_event(ctx.turn, EventMsg::TurnDiff(turn_diff_event))
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_turn_diff_event_with_timeout;
+    use crate::tools::context::SharedTurnDiffTracker;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_turn_diff_event_returns_diff_before_timeout() {
+        let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        let event = build_turn_diff_event_with_timeout(&tracker, Duration::from_secs(1), |_| {
+            Ok(Some("diff --git a/foo b/foo\n".to_string()))
+        })
+        .await;
+
+        assert_eq!(
+            event.map(|ev| ev.unified_diff),
+            Some("diff --git a/foo b/foo\n".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_turn_diff_event_times_out_without_blocking_turn_completion() {
+        let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let started_at = Instant::now();
+
+        let event = build_turn_diff_event_with_timeout(&tracker, Duration::from_millis(50), |_| {
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(Some("late diff".to_string()))
+        })
+        .await;
+
+        assert!(event.is_none());
+        assert!(
+            started_at.elapsed() < Duration::from_millis(200),
+            "turn diff generation should time out instead of blocking completion"
+        );
     }
 }

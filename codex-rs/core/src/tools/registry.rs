@@ -231,6 +231,8 @@ impl ToolRegistry {
         let is_mutating = handler.is_mutating(&invocation).await;
         let response_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();
+        let tool_name_for_logs = tool_name.clone();
+        let call_id_for_logs = call_id_owned.clone();
 
         let started = Instant::now();
         let result = otel
@@ -246,9 +248,17 @@ impl ToolRegistry {
                     let response_cell = &response_cell;
                     async move {
                         if is_mutating {
-                            tracing::trace!("waiting for tool gate");
+                            tracing::debug!(
+                                tool_name = tool_name_for_logs.as_str(),
+                                call_id = call_id_for_logs.as_str(),
+                                "waiting for mutating tool gate"
+                            );
                             invocation_for_tool.turn.tool_call_gate.wait_ready().await;
-                            tracing::trace!("tool gate released");
+                            tracing::debug!(
+                                tool_name = tool_name_for_logs.as_str(),
+                                call_id = call_id_for_logs.as_str(),
+                                "mutating tool gate released"
+                            );
                         }
                         match handler.handle_any(invocation_for_tool).await {
                             Ok(result) => {

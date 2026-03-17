@@ -14,8 +14,9 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_readiness::Readiness;
 use codex_utils_readiness::Token;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
@@ -24,7 +25,27 @@ pub(crate) struct GhostSnapshotTask {
     token: Token,
 }
 
-const SNAPSHOT_WARNING_THRESHOLD: Duration = Duration::from_secs(240);
+const SNAPSHOT_GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn mark_tool_gate_ready(gate: &codex_utils_readiness::ReadinessFlag, token: Token) {
+    match gate.mark_ready(token).await {
+        Ok(true) => info!("ghost snapshot gate marked ready"),
+        Ok(false) => warn!("ghost snapshot gate already ready"),
+        Err(err) => warn!("failed to mark ghost snapshot ready: {err}"),
+    }
+}
+
+async fn release_tool_gate_then<F, Fut>(
+    gate: &codex_utils_readiness::ReadinessFlag,
+    token: Token,
+    follow_up: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    mark_tool_gate_ready(gate, token).await;
+    follow_up().await;
+}
 
 #[async_trait]
 impl SessionTask for GhostSnapshotTask {
@@ -46,81 +67,74 @@ impl SessionTask for GhostSnapshotTask {
         tokio::task::spawn(async move {
             let token = self.token;
             let warnings_enabled = !ctx.ghost_snapshot.disable_warnings;
-            // Channel used to signal when the snapshot work has finished so the
-            // timeout warning task can exit early without sending a warning.
-            let (snapshot_done_tx, snapshot_done_rx) = oneshot::channel::<()>();
-            if warnings_enabled {
-                let ctx_for_warning = ctx.clone();
-                let cancellation_token_for_warning = cancellation_token.clone();
-                let session_for_warning = session.clone();
-                // Fire a generic warning if the snapshot is still running after
-                // three minutes; this helps users discover large untracked files
-                // that might need to be added to .gitignore.
-                tokio::task::spawn(async move {
-                    tokio::select! {
-                        _ = tokio::time::sleep(SNAPSHOT_WARNING_THRESHOLD) => {
-                            session_for_warning.session
-                                .send_event(
-                                    &ctx_for_warning,
-                                    EventMsg::Warning(WarningEvent {
-                                        message: "Repository snapshot is taking longer than expected. Large untracked or ignored files can slow snapshots; consider adding large files or directories to .gitignore or disabling `undo` in your config.".to_string()
-                                    }),
-                                )
-                                .await;
-                        }
-                        _ = snapshot_done_rx => {}
-                        _ = cancellation_token_for_warning.cancelled() => {}
-                    }
-                });
-            } else {
-                drop(snapshot_done_rx);
-            }
+            let snapshot_timed_out = Arc::new(AtomicBool::new(false));
+            let (snapshot_finished_tx, snapshot_finished_rx) = tokio::sync::oneshot::channel();
 
-            let ctx_for_task = ctx.clone();
-            let cancelled = tokio::select! {
-                _ = cancellation_token.cancelled() => true,
-                _ = async {
+            {
+                let ctx_for_task = ctx.clone();
+                let session_for_task = session.clone();
+                let snapshot_timed_out = snapshot_timed_out.clone();
+
+                tokio::task::spawn(async move {
                     let repo_path = ctx_for_task.cwd.clone();
                     let ghost_snapshot = ctx_for_task.ghost_snapshot.clone();
                     let ghost_snapshot_for_commit = ghost_snapshot.clone();
-                    // Required to run in a dedicated blocking pool.
-                    match tokio::task::spawn_blocking(move || {
-                        let options =
-                            CreateGhostCommitOptions::new(&repo_path).ghost_snapshot(ghost_snapshot_for_commit);
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let options = CreateGhostCommitOptions::new(&repo_path)
+                            .ghost_snapshot(ghost_snapshot_for_commit);
                         create_ghost_commit_with_report(&options)
                     })
-                    .await
-                    {
+                    .await;
+
+                    let timed_out = snapshot_timed_out.load(Ordering::Relaxed);
+
+                    match result {
                         Ok(Ok((ghost_commit, report))) => {
-                            info!("ghost snapshot blocking task finished");
-                            if warnings_enabled {
-                                for message in format_snapshot_warnings(
-                                    ghost_snapshot.ignore_large_untracked_files,
-                                    ghost_snapshot.ignore_large_untracked_dirs,
-                                    &report,
-                                ) {
-                                    session
-                                        .session
-                                        .send_event(
-                                            &ctx_for_task,
-                                            EventMsg::Warning(WarningEvent { message }),
-                                        )
-                                        .await;
+                            if timed_out {
+                                info!(
+                                    "ghost snapshot finished after gate timeout; discarding stale snapshot"
+                                );
+                            } else {
+                                info!("ghost snapshot blocking task finished");
+                                if warnings_enabled {
+                                    for message in format_snapshot_warnings(
+                                        ghost_snapshot.ignore_large_untracked_files,
+                                        ghost_snapshot.ignore_large_untracked_dirs,
+                                        &report,
+                                    ) {
+                                        session_for_task
+                                            .session
+                                            .send_event(
+                                                &ctx_for_task,
+                                                EventMsg::Warning(WarningEvent { message }),
+                                            )
+                                            .await;
+                                    }
                                 }
+                                session_for_task
+                                    .session
+                                    .record_conversation_items(
+                                        &ctx_for_task,
+                                        &[ResponseItem::GhostSnapshot {
+                                            ghost_commit: ghost_commit.clone(),
+                                        }],
+                                    )
+                                    .await;
+                                info!("ghost commit captured: {}", ghost_commit.id());
                             }
-                            session
-                                .session
-                                .record_conversation_items(&ctx, &[ResponseItem::GhostSnapshot {
-                                    ghost_commit: ghost_commit.clone(),
-                                }])
-                                .await;
-                            info!("ghost commit captured: {}", ghost_commit.id());
                         }
                         Ok(Err(err)) => match err {
                             GitToolingError::NotAGitRepository { .. } => info!(
                                 sub_id = ctx_for_task.sub_id.as_str(),
                                 "skipping ghost snapshot because current directory is not a Git repository"
                             ),
+                            _ if timed_out => {
+                                info!(
+                                    sub_id = ctx_for_task.sub_id.as_str(),
+                                    "ghost snapshot failed after gate timeout: {err}"
+                                );
+                            }
                             _ => {
                                 warn!(
                                     sub_id = ctx_for_task.sub_id.as_str(),
@@ -128,6 +142,12 @@ impl SessionTask for GhostSnapshotTask {
                                 );
                             }
                         },
+                        Err(err) if timed_out => {
+                            warn!(
+                                sub_id = ctx_for_task.sub_id.as_str(),
+                                "ghost snapshot task panicked after gate timeout: {err}"
+                            );
+                        }
                         Err(err) => {
                             warn!(
                                 sub_id = ctx_for_task.sub_id.as_str(),
@@ -135,25 +155,48 @@ impl SessionTask for GhostSnapshotTask {
                             );
                             let message =
                                 format!("Snapshots disabled after ghost snapshot panic: {err}.");
-                            session
+                            session_for_task
                                 .session
                                 .notify_background_event(&ctx_for_task, message)
                                 .await;
                         }
                     }
-                } => false,
-            };
 
-            let _ = snapshot_done_tx.send(());
+                    let _ = snapshot_finished_tx.send(());
+                });
+            }
+
+            let cancelled = tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    snapshot_timed_out.store(true, Ordering::Relaxed);
+                    true
+                }
+                _ = snapshot_finished_rx => false,
+                _ = tokio::time::sleep(SNAPSHOT_GATE_TIMEOUT) => {
+                    snapshot_timed_out.store(true, Ordering::Relaxed);
+                    false
+                }
+            };
 
             if cancelled {
                 info!("ghost snapshot task cancelled");
             }
 
-            match ctx.tool_call_gate.mark_ready(token).await {
-                Ok(true) => info!("ghost snapshot gate marked ready"),
-                Ok(false) => warn!("ghost snapshot gate already ready"),
-                Err(err) => warn!("failed to mark ghost snapshot ready: {err}"),
+            if snapshot_timed_out.load(Ordering::Relaxed) && warnings_enabled && !cancelled {
+                release_tool_gate_then(&ctx.tool_call_gate, token, || async {
+                    session
+                        .session
+                        .send_event(
+                            &ctx,
+                            EventMsg::Warning(WarningEvent {
+                                message: "Repository snapshot is taking too long. Continuing without an undo snapshot for this turn; large untracked or ignored files can slow snapshots.".to_string(),
+                            }),
+                        )
+                        .await;
+                })
+                .await;
+            } else {
+                mark_tool_gate_ready(&ctx.tool_call_gate, token).await;
             }
         });
         None
@@ -253,8 +296,12 @@ fn format_bytes(bytes: i64) -> String {
 mod tests {
     use super::*;
     use codex_git::LargeUntrackedDir;
+    use codex_utils_readiness::Readiness;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     #[test]
     fn large_untracked_warning_includes_threshold() {
@@ -281,5 +328,39 @@ mod tests {
         };
 
         assert_eq!(format_large_untracked_warning(None, &report), None);
+    }
+
+    #[tokio::test]
+    async fn release_tool_gate_then_marks_ready_before_follow_up_finishes() {
+        let gate = Arc::new(codex_utils_readiness::ReadinessFlag::new());
+        let token = gate.subscribe().await.expect("token");
+        let (follow_up_started_tx, follow_up_started_rx) = oneshot::channel();
+        let (follow_up_finish_tx, follow_up_finish_rx) = oneshot::channel::<()>();
+
+        let waiter = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move {
+                gate.wait_ready().await;
+            }
+        });
+
+        let helper = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move {
+                release_tool_gate_then(&gate, token, || async {
+                    let _ = follow_up_started_tx.send(());
+                    let _ = follow_up_finish_rx.await;
+                })
+                .await;
+            }
+        });
+
+        follow_up_started_rx.await.expect("follow-up started");
+        timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("gate should be ready before follow-up completes")
+            .expect("waiter task");
+        let _ = follow_up_finish_tx.send(());
+        helper.await.expect("helper task");
     }
 }

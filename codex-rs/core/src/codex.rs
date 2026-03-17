@@ -254,7 +254,6 @@ use crate::protocol::Submission;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
-use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
@@ -286,6 +285,7 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::events::build_turn_diff_event;
 use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::js_repl::JsReplHandle;
 use crate::tools::js_repl::resolve_compatible_node;
@@ -7194,15 +7194,11 @@ async fn try_run_sampling_request(
         return Err(CodexErr::TurnAborted);
     }
 
-    if should_emit_turn_diff {
-        let unified_diff = {
-            let mut tracker = turn_diff_tracker.lock().await;
-            tracker.get_unified_diff()
-        };
-        if let Ok(Some(unified_diff)) = unified_diff {
-            let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
-            sess.clone().send_event(&turn_context, msg).await;
-        }
+    if should_emit_turn_diff
+        && let Some(turn_diff_event) = build_turn_diff_event(&turn_diff_tracker).await
+    {
+        let msg = EventMsg::TurnDiff(turn_diff_event);
+        sess.clone().send_event(&turn_context, msg).await;
     }
 
     outcome
