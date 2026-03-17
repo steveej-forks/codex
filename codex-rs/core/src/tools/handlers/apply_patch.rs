@@ -35,6 +35,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tracing::debug;
 
 pub struct ApplyPatchHandler;
 
@@ -136,6 +137,12 @@ impl ToolHandler for ApplyPatchHandler {
         // Avoid building temporary ExecParams/command vectors; derive directly from inputs.
         let cwd = turn.cwd.clone();
         let command = vec!["apply_patch".to_string(), patch_input.clone()];
+        debug!(
+            call_id = call_id.as_str(),
+            patch_bytes = patch_input.len(),
+            cwd = %cwd.display(),
+            "verifying apply_patch input"
+        );
         match codex_apply_patch::maybe_parse_apply_patch_verified(
             &command,
             &cwd,
@@ -150,6 +157,12 @@ impl ToolHandler for ApplyPatchHandler {
                     InternalApplyPatchInvocation::DelegateToExec(apply) => {
                         let changes = convert_apply_patch_to_protocol(&apply.action);
                         let file_paths = file_paths_for_action(&apply.action);
+                        debug!(
+                            call_id = call_id.as_str(),
+                            file_count = file_paths.len(),
+                            change_count = changes.len(),
+                            "apply_patch delegated to runtime"
+                        );
                         let effective_additional_permissions = apply_granted_turn_permissions(
                             session.as_ref(),
                             crate::sandboxing::SandboxPermissions::UseDefault,
@@ -164,6 +177,7 @@ impl ToolHandler for ApplyPatchHandler {
                             &call_id,
                             Some(&tracker),
                         );
+                        debug!(call_id = call_id.as_str(), "emitting apply_patch begin");
                         emitter.begin(event_ctx).await;
 
                         let req = ApplyPatchRequest {
@@ -189,6 +203,7 @@ impl ToolHandler for ApplyPatchHandler {
                             call_id: call_id.clone(),
                             tool_name: tool_name.to_string(),
                         };
+                        debug!(call_id = call_id.as_str(), "running apply_patch runtime");
                         let out = orchestrator
                             .run(
                                 &mut runtime,
@@ -199,13 +214,28 @@ impl ToolHandler for ApplyPatchHandler {
                             )
                             .await
                             .map(|result| result.output);
+                        match &out {
+                            Ok(output) => debug!(
+                                call_id = call_id.as_str(),
+                                exit_code = output.exit_code,
+                                duration_ms = output.duration.as_millis(),
+                                "apply_patch runtime completed"
+                            ),
+                            Err(err) => debug!(
+                                call_id = call_id.as_str(),
+                                error = ?err,
+                                "apply_patch runtime returned error"
+                            ),
+                        }
                         let event_ctx = ToolEventCtx::new(
                             session.as_ref(),
                             turn.as_ref(),
                             &call_id,
                             Some(&tracker),
                         );
+                        debug!(call_id = call_id.as_str(), "finalizing apply_patch events");
                         let content = emitter.finish(event_ctx, out).await?;
+                        debug!(call_id = call_id.as_str(), "apply_patch finalized");
                         Ok(FunctionToolOutput::from_text(content, Some(true)))
                     }
                 }
@@ -272,6 +302,7 @@ pub(crate) async fn intercept_apply_patch(
                         call_id,
                         tracker.as_ref().copied(),
                     );
+                    debug!(call_id, "emitting intercepted apply_patch begin");
                     emitter.begin(event_ctx).await;
 
                     let req = ApplyPatchRequest {
@@ -296,6 +327,7 @@ pub(crate) async fn intercept_apply_patch(
                         call_id: call_id.to_string(),
                         tool_name: tool_name.to_string(),
                     };
+                    debug!(call_id, "running intercepted apply_patch runtime");
                     let out = orchestrator
                         .run(
                             &mut runtime,
@@ -306,13 +338,28 @@ pub(crate) async fn intercept_apply_patch(
                         )
                         .await
                         .map(|result| result.output);
+                    match &out {
+                        Ok(output) => debug!(
+                            call_id,
+                            exit_code = output.exit_code,
+                            duration_ms = output.duration.as_millis(),
+                            "intercepted apply_patch runtime completed"
+                        ),
+                        Err(err) => debug!(
+                            call_id,
+                            error = ?err,
+                            "intercepted apply_patch runtime returned error"
+                        ),
+                    }
                     let event_ctx = ToolEventCtx::new(
                         session.as_ref(),
                         turn.as_ref(),
                         call_id,
                         tracker.as_ref().copied(),
                     );
+                    debug!(call_id, "finalizing intercepted apply_patch events");
                     let content = emitter.finish(event_ctx, out).await?;
+                    debug!(call_id, "intercepted apply_patch finalized");
                     Ok(Some(FunctionToolOutput::from_text(content, Some(true))))
                 }
             }

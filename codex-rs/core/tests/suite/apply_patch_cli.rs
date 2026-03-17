@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used)]
 
 use anyhow::Result;
+#[cfg(unix)]
+use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_test_macros::large_stack_test;
 use core_test_support::responses::ev_apply_patch_call;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
@@ -8,8 +10,12 @@ use core_test_support::responses::ev_shell_command_call;
 use core_test_support::test_codex::ApplyPatchModelOutput;
 use pretty_assertions::assert_eq;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use codex_core::features::Feature;
 use codex_protocol::protocol::AskForApproval;
@@ -32,6 +38,7 @@ use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use serde_json::json;
+use tempfile::TempDir;
 use test_case::test_case;
 use wiremock::Mock;
 use wiremock::Respond;
@@ -83,6 +90,18 @@ fn apply_patch_responses(
             ev_completed("resp-2"),
         ]),
     ]
+}
+
+#[cfg(unix)]
+fn write_hanging_apply_patch_exe(path: &std::path::Path) -> Result<()> {
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"{CODEX_CORE_APPLY_PATCH_ARG1}\" ]; then\n  while :; do :; done\nfi\nprintf 'unexpected invocation: %s\\n' \"$*\" >&2\nexit 1\n"
+    );
+    fs::write(path, script)?;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
 }
 
 #[large_stack_test]
@@ -1024,6 +1043,133 @@ async fn apply_patch_shell_command_failure_propagates_error_and_skips_diff() -> 
         "expected file path in output: {out}"
     );
     assert_eq!(fs::read_to_string(&target)?, "ok\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[large_stack_test]
+async fn apply_patch_shell_command_timeout_fails_cleanly_without_hanging() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let home = Arc::new(TempDir::new()?);
+    let fake_codex = home.path().join("fake-codex-apply-patch-timeout");
+    write_hanging_apply_patch_exe(&fake_codex)?;
+
+    let harness = apply_patch_harness_with(|builder| {
+        let fake_codex = fake_codex.clone();
+        builder
+            .with_model("gpt-5.1")
+            .with_home(home.clone())
+            .with_config(move |config| {
+                config.codex_linux_sandbox_exe = Some(fake_codex);
+            })
+    })
+    .await?;
+    let test = harness.test();
+    let codex = test.codex.clone();
+    let cwd = test.cwd.clone();
+
+    let target = cwd.path().join("timeout.txt");
+    fs::write(&target, "before\n")?;
+
+    let script = "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: timeout.txt\n@@\n-before\n+after\n*** End Patch\nEOF\n";
+    let call_id = "shell-apply-timeout";
+    let args = json!({ "command": script, "timeout_ms": 100 });
+    let bodies = vec![
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-1"),
+        ]),
+        sse(vec![
+            ev_assistant_message("msg-1", "timed out"),
+            ev_completed("resp-2"),
+        ]),
+    ];
+    mount_sse_sequence(harness.server(), bodies).await;
+
+    let model = test.session_configured.model.clone();
+    let (saw_patch_begin, patch_end_success, patch_end_status, saw_turn_diff) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            codex
+                .submit(Op::UserTurn {
+                    items: vec![UserInput::Text {
+                        text: "apply patch via shell and time out".into(),
+                        text_elements: Vec::new(),
+                    }],
+                    final_output_json_schema: None,
+                    cwd: cwd.path().to_path_buf(),
+                    approval_policy: AskForApproval::Never,
+                    sandbox_policy: SandboxPolicy::DangerFullAccess,
+                    model,
+                    effort: None,
+                    summary: None,
+                    service_tier: None,
+                    collaboration_mode: None,
+                    personality: None,
+                })
+                .await?;
+
+            let mut saw_patch_begin = false;
+            let mut patch_end_success = None;
+            let mut patch_end_status = None;
+            let mut saw_turn_diff = false;
+            wait_for_event(&codex, |event| match event {
+                EventMsg::PatchApplyBegin(begin) => {
+                    saw_patch_begin = true;
+                    assert_eq!(begin.call_id, call_id);
+                    false
+                }
+                EventMsg::PatchApplyEnd(end) => {
+                    assert_eq!(end.call_id, call_id);
+                    patch_end_success = Some(end.success);
+                    patch_end_status = Some(end.status.clone());
+                    false
+                }
+                EventMsg::TurnDiff(_) => {
+                    saw_turn_diff = true;
+                    false
+                }
+                EventMsg::TurnComplete(_) => true,
+                _ => false,
+            })
+            .await;
+
+            Ok::<_, anyhow::Error>((
+                saw_patch_begin,
+                patch_end_success,
+                patch_end_status,
+                saw_turn_diff,
+            ))
+        })
+        .await
+        .expect("timed out waiting for apply_patch timeout turn to complete")?;
+
+    let out = harness.function_call_stdout(call_id).await;
+    assert!(
+        saw_patch_begin,
+        "expected PatchApplyBegin event; output={out}"
+    );
+    assert_eq!(
+        patch_end_success,
+        Some(false),
+        "expected PatchApplyEnd.success=false; output={out}"
+    );
+    assert_eq!(
+        patch_end_status,
+        Some(codex_protocol::protocol::PatchApplyStatus::Failed),
+        "expected failed PatchApplyEnd status; output={out}"
+    );
+    assert!(
+        !saw_turn_diff,
+        "turn diff should not be emitted when apply_patch times out; output={out}"
+    );
+    assert!(
+        out.contains("command timed out"),
+        "expected timeout output: {out}"
+    );
+    assert_eq!(fs::read_to_string(&target)?, "before\n");
+
     Ok(())
 }
 

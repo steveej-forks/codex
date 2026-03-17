@@ -92,6 +92,55 @@ async fn custom_tool_unknown_returns_custom_output_error() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_tool_incompatible_known_tool_records_custom_output_error() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.1");
+    let test = builder.build(&server).await?;
+
+    let call_id = "custom-incompatible-shell";
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call(call_id, "shell", "\"payload\""),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn_with_policies(
+        "invoke shell as a custom tool",
+        AskForApproval::Never,
+        SandboxPolicy::DangerFullAccess,
+    )
+    .await?;
+
+    let (content, success) = follow_up
+        .single_request()
+        .custom_tool_call_output_content_and_success(call_id)
+        .expect("missing custom tool output for incompatible shell call");
+    let content = content.expect("missing custom tool output content");
+    assert!(
+        success.is_none(),
+        "string custom outputs do not preserve success"
+    );
+    assert_eq!(content, "tool shell invoked with incompatible payload");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

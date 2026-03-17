@@ -11,7 +11,7 @@ use crate::guardian::review_approval_request;
 use crate::guardian::routes_approval_to_guardian;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxPermissions;
-// use crate::sandboxing::execute_env;
+use crate::sandboxing::execute_env;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
@@ -32,6 +32,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::PathBuf;
+/// Apply-patch can legitimately take longer than normal exec calls on larger files,
+/// but it must not be allowed to stall a turn indefinitely.
+const DEFAULT_APPLY_PATCH_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Debug)]
 pub struct ApplyPatchRequest {
@@ -63,7 +66,7 @@ impl ApplyPatchRuntime {
         }
     }
 
-    fn _build_command_spec(
+    fn build_command_spec(
         req: &ApplyPatchRequest,
         _codex_home: &std::path::Path,
     ) -> Result<CommandSpec, ToolError> {
@@ -89,7 +92,10 @@ impl ApplyPatchRuntime {
                 req.action.patch.clone(),
             ],
             cwd: req.action.cwd.clone(),
-            expiration: req.timeout_ms.into(),
+            expiration: req
+                .timeout_ms
+                .unwrap_or(DEFAULT_APPLY_PATCH_TIMEOUT_MS)
+                .into(),
             // Run apply_patch with a minimal environment for determinism and to avoid leaks.
             env: HashMap::new(),
             sandbox_permissions: req.sandbox_permissions,
@@ -98,7 +104,7 @@ impl ApplyPatchRuntime {
         })
     }
 
-    fn _stdout_stream(ctx: &ToolCtx) -> Option<crate::exec::StdoutStream> {
+    fn stdout_stream(ctx: &ToolCtx) -> Option<crate::exec::StdoutStream> {
         Some(crate::exec::StdoutStream {
             sub_id: ctx.turn.sub_id.clone(),
             call_id: ctx.call_id.clone(),
@@ -190,56 +196,18 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
     async fn run(
         &mut self,
         req: &ApplyPatchRequest,
-        _attempt: &SandboxAttempt<'_>,
+        attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        process_apply_patch(&req.action.patch, &ctx.session)
-        // let spec = Self::build_command_spec(req, &ctx.turn.config.codex_home)?;
-        // let env = attempt
-        //     .env_for(spec, None)
-        //     .map_err(|err| ToolError::Codex(err.into()))?;
-        // let out = execute_env(env, Self::stdout_stream(ctx))
-        //     .await
-        //     .map_err(ToolError::Codex)?;
-        // Ok(out)
+        let spec = Self::build_command_spec(req, &ctx.turn.config.codex_home)?;
+        let env = attempt
+            .env_for(spec, None)
+            .map_err(|err| ToolError::Codex(err.into()))?;
+        let out = execute_env(env, Self::stdout_stream(ctx))
+            .await
+            .map_err(ToolError::Codex)?;
+        Ok(out)
     }
-}
-
-fn process_apply_patch(
-    patch: &str,
-    session: &crate::codex::Session,
-) -> Result<crate::tools::ExecToolCallOutput, crate::tools::sandboxing::ToolError> {
-    use crate::exec::StreamOutput;
-
-    let start = std::time::Instant::now();
-
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let exit_code = match codex_apply_patch::apply_patch(
-        patch,
-        &mut stdout,
-        &mut stderr,
-        session.fs.as_ref(),
-    ) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    };
-    let duration = start.elapsed();
-
-    let stdout = StreamOutput::new(String::from_utf8_lossy(&stdout).to_string());
-    let stderr = StreamOutput::new(String::from_utf8_lossy(&stderr).to_string());
-    let aggregated_output =
-        StreamOutput::new([stdout.text.as_str(), stderr.text.as_str()].join(""));
-    let exec_output = crate::tools::ExecToolCallOutput {
-        exit_code,
-        stdout,
-        stderr,
-        aggregated_output,
-        duration,
-        timed_out: false,
-    };
-
-    Ok(exec_output)
 }
 
 #[cfg(test)]
@@ -312,5 +280,57 @@ mod tests {
                 patch: expected_patch,
             }
         );
+    }
+
+    #[test]
+    fn build_command_spec_uses_conservative_default_timeout() {
+        let path = std::env::temp_dir().join("apply-patch-default-timeout-test.txt");
+        let request = ApplyPatchRequest {
+            action: ApplyPatchAction::new_add_for_test(&path, "hello".to_string()),
+            file_paths: vec![],
+            changes: HashMap::new(),
+            exec_approval_requirement: ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            additional_permissions: None,
+            permissions_preapproved: false,
+            timeout_ms: None,
+            codex_exe: Some(PathBuf::from("/bin/echo")),
+        };
+
+        let spec = ApplyPatchRuntime::build_command_spec(&request, std::path::Path::new("/tmp"))
+            .expect("build command spec");
+
+        assert_eq!(
+            spec.expiration.timeout_ms(),
+            Some(DEFAULT_APPLY_PATCH_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn build_command_spec_respects_explicit_timeout() {
+        let path = std::env::temp_dir().join("apply-patch-explicit-timeout-test.txt");
+        let explicit_timeout_ms = 42_000;
+        let request = ApplyPatchRequest {
+            action: ApplyPatchAction::new_add_for_test(&path, "hello".to_string()),
+            file_paths: vec![],
+            changes: HashMap::new(),
+            exec_approval_requirement: ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            additional_permissions: None,
+            permissions_preapproved: false,
+            timeout_ms: Some(explicit_timeout_ms),
+            codex_exe: Some(PathBuf::from("/bin/echo")),
+        };
+
+        let spec = ApplyPatchRuntime::build_command_spec(&request, std::path::Path::new("/tmp"))
+            .expect("build command spec");
+
+        assert_eq!(spec.expiration.timeout_ms(), Some(explicit_timeout_ms));
     }
 }
