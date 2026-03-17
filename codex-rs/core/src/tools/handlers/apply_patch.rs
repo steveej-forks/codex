@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::apply_patch;
 use crate::apply_patch::InternalApplyPatchInvocation;
@@ -36,10 +37,13 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::debug;
+use tracing::warn;
 
 pub struct ApplyPatchHandler;
 
 const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("tool_apply_patch.lark");
+const APPLY_PATCH_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+const APPLY_PATCH_VERIFY_ATTEMPTS: usize = 2;
 
 fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<AbsolutePathBuf> {
     let mut keys = Vec::new();
@@ -88,6 +92,85 @@ fn write_permissions_for_paths(file_paths: &[AbsolutePathBuf]) -> Option<Permiss
     })?;
 
     crate::sandboxing::normalize_additional_permissions(permissions).ok()
+}
+
+async fn verify_apply_patch_input(
+    command: &[String],
+    cwd: &Path,
+    fs: Arc<dyn crate::codex::Fs>,
+    call_id: &str,
+) -> Result<codex_apply_patch::MaybeApplyPatchVerified, FunctionCallError> {
+    verify_apply_patch_input_with_policy(
+        command,
+        cwd,
+        fs,
+        call_id,
+        APPLY_PATCH_VERIFY_TIMEOUT,
+        APPLY_PATCH_VERIFY_ATTEMPTS,
+    )
+    .await
+}
+
+async fn verify_apply_patch_input_with_policy(
+    command: &[String],
+    cwd: &Path,
+    fs: Arc<dyn crate::codex::Fs>,
+    call_id: &str,
+    timeout_duration: Duration,
+    max_attempts: usize,
+) -> Result<codex_apply_patch::MaybeApplyPatchVerified, FunctionCallError> {
+    let attempts = max_attempts.max(1);
+
+    for attempt in 1..=attempts {
+        let command = command.to_vec();
+        let cwd = cwd.to_path_buf();
+        let fs = fs.clone();
+        let verification = tokio::task::spawn_blocking(move || {
+            codex_apply_patch::maybe_parse_apply_patch_verified(&command, &cwd, fs.as_ref())
+        });
+
+        match tokio::time::timeout(timeout_duration, verification).await {
+            Ok(Ok(result)) => {
+                if attempt > 1 {
+                    debug!(
+                        call_id = call_id,
+                        attempt, attempts, "apply_patch verification succeeded after retry"
+                    );
+                }
+                return Ok(result);
+            }
+            Ok(Err(error)) => {
+                warn!(
+                    call_id = call_id,
+                    attempt,
+                    attempts,
+                    error = ?error,
+                    "apply_patch verification worker failed"
+                );
+                if attempt == attempts {
+                    return Err(FunctionCallError::RespondToModel(
+                        "apply_patch verification failed due to an internal error".to_string(),
+                    ));
+                }
+            }
+            Err(_) => {
+                warn!(
+                    call_id = call_id,
+                    attempt,
+                    attempts,
+                    timeout_ms = timeout_duration.as_millis(),
+                    "apply_patch verification timed out"
+                );
+                if attempt == attempts {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "apply_patch verification timed out after {attempts} attempts"
+                    )));
+                }
+            }
+        }
+    }
+
+    unreachable!("verification loop should always return");
 }
 
 #[async_trait]
@@ -143,11 +226,8 @@ impl ToolHandler for ApplyPatchHandler {
             cwd = %cwd.display(),
             "verifying apply_patch input"
         );
-        match codex_apply_patch::maybe_parse_apply_patch_verified(
-            &command,
-            &cwd,
-            session.fs.as_ref(),
-        ) {
+        match verify_apply_patch_input(&command, &cwd, session.fs.clone(), call_id.as_str()).await?
+        {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
                 match apply_patch::apply_patch(turn.as_ref(), changes).await {
                     InternalApplyPatchInvocation::Output(item) => {
@@ -271,7 +351,7 @@ pub(crate) async fn intercept_apply_patch(
     call_id: &str,
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
-    match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, session.fs.as_ref()) {
+    match verify_apply_patch_input(command, cwd, session.fs.clone(), call_id).await? {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
             session
                 .record_model_warning(
@@ -487,6 +567,10 @@ mod tests {
     use super::*;
     use codex_apply_patch::MaybeApplyPatchVerified;
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::thread;
     use tempfile::TempDir;
 
     #[test]
@@ -515,5 +599,84 @@ mod tests {
 
         let keys = file_paths_for_action(&action);
         assert_eq!(keys.len(), 2);
+    }
+
+    struct SlowFs {
+        delay: Duration,
+        delayed_reads: usize,
+        reads: AtomicUsize,
+    }
+
+    impl codex_apply_patch::Fs for SlowFs {
+        fn read_to_string(&self, _path: &Path) -> std::io::Result<String> {
+            let read_index = self.reads.fetch_add(1, Ordering::SeqCst);
+            if read_index < self.delayed_reads {
+                thread::sleep(self.delay);
+            }
+            Ok("old content\n".to_string())
+        }
+    }
+
+    impl crate::codex::Fs for SlowFs {}
+
+    fn delete_patch_command() -> Vec<String> {
+        vec![
+            "apply_patch".to_string(),
+            "*** Begin Patch\n*** Delete File: slow.txt\n*** End Patch".to_string(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn apply_patch_verification_retries_after_timeout() {
+        let fs: Arc<dyn crate::codex::Fs> = Arc::new(SlowFs {
+            delay: Duration::from_millis(50),
+            delayed_reads: 1,
+            reads: AtomicUsize::new(0),
+        });
+        let cwd = PathBuf::from("/tmp");
+
+        let verified = verify_apply_patch_input_with_policy(
+            &delete_patch_command(),
+            &cwd,
+            fs,
+            "call_retry",
+            Duration::from_millis(10),
+            2,
+        )
+        .await
+        .expect("verification should succeed after retry");
+
+        assert!(matches!(
+            verified,
+            codex_apply_patch::MaybeApplyPatchVerified::Body(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn apply_patch_verification_times_out_after_retries() {
+        let fs: Arc<dyn crate::codex::Fs> = Arc::new(SlowFs {
+            delay: Duration::from_millis(50),
+            delayed_reads: usize::MAX,
+            reads: AtomicUsize::new(0),
+        });
+        let cwd = PathBuf::from("/tmp");
+
+        let error = verify_apply_patch_input_with_policy(
+            &delete_patch_command(),
+            &cwd,
+            fs,
+            "call_timeout",
+            Duration::from_millis(10),
+            2,
+        )
+        .await
+        .expect_err("verification should fail after exhausting retries");
+
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(
+                "apply_patch verification timed out after 2 attempts".to_string()
+            )
+        );
     }
 }
