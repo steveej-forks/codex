@@ -2,16 +2,14 @@
 //! Apply Patch runtime: executes verified patches under the orchestrator.
 //!
 //! Assumes `apply_patch` verification/approval happened upstream. Reuses that
-//! decision to avoid re-prompting, builds the self-invocation command for
-//! `codex --codex-run-as-apply-patch`, and runs under the current
-//! `SandboxAttempt` with a minimal environment.
+//! decision to avoid re-prompting, and applies patches through the session FS
+//! so ACP-backed editors can surface native review workflows.
 use crate::exec::ExecToolCallOutput;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::review_approval_request;
 use crate::guardian::routes_approval_to_guardian;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxPermissions;
-use crate::sandboxing::execute_env;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
@@ -32,6 +30,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 /// Apply-patch can legitimately take longer than normal exec calls on larger files,
 /// but it must not be allowed to stall a turn indefinitely.
 const DEFAULT_APPLY_PATCH_TIMEOUT_MS: u64 = 300_000;
@@ -196,17 +195,92 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
     async fn run(
         &mut self,
         req: &ApplyPatchRequest,
-        attempt: &SandboxAttempt<'_>,
+        _attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        let spec = Self::build_command_spec(req, &ctx.turn.config.codex_home)?;
-        let env = attempt
-            .env_for(spec, None)
-            .map_err(|err| ToolError::Codex(err.into()))?;
-        let out = execute_env(env, Self::stdout_stream(ctx))
-            .await
-            .map_err(ToolError::Codex)?;
-        Ok(out)
+        run_blocking_apply_patch_with_timeout(
+            req.action.patch.clone(),
+            ctx.session.clone(),
+            req.timeout_ms.unwrap_or(DEFAULT_APPLY_PATCH_TIMEOUT_MS),
+        )
+        .await
+    }
+}
+
+fn process_apply_patch(
+    patch: &str,
+    session: &crate::codex::Session,
+) -> Result<ExecToolCallOutput, ToolError> {
+    use crate::exec::StreamOutput;
+
+    let start = Instant::now();
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit_code = match codex_apply_patch::apply_patch(
+        patch,
+        &mut stdout,
+        &mut stderr,
+        session.fs.as_ref(),
+    ) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    };
+    let duration = start.elapsed();
+
+    let stdout = StreamOutput::new(String::from_utf8_lossy(&stdout).to_string());
+    let stderr = StreamOutput::new(String::from_utf8_lossy(&stderr).to_string());
+    let aggregated_output =
+        StreamOutput::new([stdout.text.as_str(), stderr.text.as_str()].join(""));
+
+    Ok(ExecToolCallOutput {
+        exit_code,
+        stdout,
+        stderr,
+        aggregated_output,
+        duration,
+        timed_out: false,
+    })
+}
+
+async fn run_blocking_apply_patch_with_timeout(
+    patch: String,
+    session: std::sync::Arc<crate::codex::Session>,
+    timeout_ms: u64,
+) -> Result<ExecToolCallOutput, ToolError> {
+    run_blocking_exec_with_timeout(timeout_ms, move || process_apply_patch(&patch, &session)).await
+}
+
+async fn run_blocking_exec_with_timeout<F>(
+    timeout_ms: u64,
+    work: F,
+) -> Result<ExecToolCallOutput, ToolError>
+where
+    F: FnOnce() -> Result<ExecToolCallOutput, ToolError> + Send + 'static,
+{
+    let started = Instant::now();
+    match tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        tokio::task::spawn_blocking(work),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => Err(ToolError::Rejected(format!(
+            "apply_patch worker join failed: {err}"
+        ))),
+        Err(_) => Ok(timeout_exec_output(started.elapsed())),
+    }
+}
+
+fn timeout_exec_output(duration: Duration) -> ExecToolCallOutput {
+    ExecToolCallOutput {
+        exit_code: 124,
+        stdout: crate::exec::StreamOutput::new(String::new()),
+        stderr: crate::exec::StreamOutput::new(String::new()),
+        aggregated_output: crate::exec::StreamOutput::new(String::new()),
+        duration,
+        timed_out: true,
     }
 }
 
@@ -216,6 +290,7 @@ mod tests {
     use codex_protocol::protocol::RejectConfig;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
+    use std::thread;
 
     #[test]
     fn wants_no_sandbox_approval_reject_respects_sandbox_flag() {
@@ -332,5 +407,38 @@ mod tests {
             .expect("build command spec");
 
         assert_eq!(spec.expiration.timeout_ms(), Some(explicit_timeout_ms));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_apply_patch_timeout_returns_timed_out_output() {
+        let output = run_blocking_exec_with_timeout(10, move || {
+            thread::sleep(Duration::from_millis(50));
+            Ok(ExecToolCallOutput::default())
+        })
+        .await
+        .expect("timeout output");
+
+        assert!(output.timed_out);
+        assert_eq!(output.exit_code, 124);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_apply_patch_timeout_preserves_successful_output() {
+        let output = run_blocking_exec_with_timeout(50, move || {
+            Ok(ExecToolCallOutput {
+                exit_code: 0,
+                stdout: crate::exec::StreamOutput::new("ok".to_string()),
+                stderr: crate::exec::StreamOutput::new(String::new()),
+                aggregated_output: crate::exec::StreamOutput::new("ok".to_string()),
+                duration: Duration::from_millis(1),
+                timed_out: false,
+            })
+        })
+        .await
+        .expect("successful output");
+
+        assert!(!output.timed_out);
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout.text, "ok");
     }
 }
